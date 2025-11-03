@@ -1,0 +1,19 @@
+{
+  "name": "isucon-practice",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "bench": "node bench-logs.mjs",
+    "stats": "curl -s http://localhost:3000/stats | node -e \"console.log(JSON.stringify(JSON.parse(require('fs').readFileSync(0, 'utf-8')), null, 2))\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0"
+  }
+}
