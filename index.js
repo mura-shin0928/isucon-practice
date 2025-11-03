@@ -1,139 +1,98 @@
-// server.js or app.js
+// index.js
 import express from "express";
+import mysql from "mysql2/promise";
+
 const app = express();
 const port = 3000;
 
-// キャッシュを格納する変数
-let itemsCache = null;
-let lastFetchedAt = null;
-let requestCount = 0;
-let cacheHitCount = 0;
+// =============================
+// MySQL プール
+// =============================
+const pool = mysql.createPool({
+  host: process.env.MYSQL_HOST || "127.0.0.1",
+  user: process.env.MYSQL_USER || "root",
+  password: process.env.MYSQL_PASSWORD || "password",
+  database: process.env.MYSQL_DB || "isucon_practice",
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
 
-// 重い処理をシミュレート（データベースクエリや計算処理を模擬）
-async function simulateHeavyOperation() {
-  // CPU集約的な処理をシミュレート（10-20ms程度の遅延）
+// =============================
+// キャッシュ用（DB結果のTTLキャッシュ）
+// =============================
+let dbBufCache = null;        // Buffer化した固定レスポンス
+let dbCacheExpiresAt = 0;     // 期限（ms）
+const DB_CACHE_TTL_MS = 60_000; // 60s: 計測10s+ウォームアップを覆う長め
+
+// =============================
+// 共通: DBからitems取得
+// =============================
+async function fetchItemsFromDB() {
+  const [rows] = await pool.query(
+    "SELECT id, name, description, price, category FROM items"
+  );
+  return rows;
+}
+
+// =============================
+// エンドポイント
+// =============================
+
+// A) 毎回DBアクセス（キャッシュなし）
+app.get("/items-db", async (_req, res) => {
   const start = Date.now();
-  let result = 0;
-  for (let i = 0; i < 1000000; i++) {
-    result += Math.sqrt(i) * Math.random();
-  }
-  const processingTime = Date.now() - start;
-  
-  // さらにネットワークI/OやDBアクセスをシミュレート（5-15ms）
-  await new Promise(resolve => setTimeout(resolve, 5 + Math.random() * 10));
-  
-  return processingTime;
-}
-
-// データ生成処理（重い処理を含む）
-async function generateItems() {
-  await simulateHeavyOperation();
-  
-  // より大きなデータセットを生成
-  const items = [];
-  for (let i = 1; i <= 100; i++) {
-    items.push({
-      id: i,
-      name: `Item ${i}`,
-      description: `This is item number ${i} with some description text`,
-      price: Math.floor(Math.random() * 10000),
-      category: ['Electronics', 'Food', 'Clothing', 'Books'][i % 4],
-    });
-  }
-  return items;
-}
-
-app.get("/items", async (req, res) => {
-  const startTime = Date.now();
-  requestCount++;
-  
-  // キャッシュがあればそれを返す（即座に返す）
-  if (itemsCache) {
-    cacheHitCount++;
-    const responseTime = Date.now() - startTime;
-    return res.json({
-      source: "cache",
-      fetchedAt: lastFetchedAt,
-      processingTimeMs: responseTime,
-      items: itemsCache,
-    });
-  }
-
-  // キャッシュがない場合は重い処理を実行
-  const items = await generateItems();
-
-  // キャッシュに保存
-  itemsCache = items;
-  lastFetchedAt = new Date().toISOString();
-  const responseTime = Date.now() - startTime;
-
-  res.json({
-    source: "fresh",
-    fetchedAt: lastFetchedAt,
-    processingTimeMs: responseTime,
-    items,
-  });
+  const items = await fetchItemsFromDB();
+  res.json({ source: "db", elapsedMs: Date.now() - start, items });
 });
 
-// キャッシュなし版（比較用）
-app.get("/items-no-cache", async (req, res) => {
-  const startTime = Date.now();
-  const items = await generateItems();
-  const responseTime = Date.now() - startTime;
-
-  res.json({
-    source: "no-cache",
-    processingTimeMs: responseTime,
-    items,
-  });
+// B) TTLキャッシュ（ヒット時ゼロ変換）
+// - JSON文字列→Bufferを事前生成して再利用
+// - 動的フィールドは入れない（毎回stringifyを避ける）
+app.set("etag", false);
+app.get("/items-db-cache", async (_req, res) => {
+  const start = Date.now();
+  const now = Date.now();
+  
+  // キャッシュヒット時
+  if (dbBufCache && now < dbCacheExpiresAt) {
+    const elapsedMs = Date.now() - start;
+    // キャッシュヒット時は処理時間を追加（計測用）
+    // ただし、BufferではなくJSONで返す（計測のため）
+    const cached = JSON.parse(dbBufCache.toString());
+    return res.json({ ...cached, elapsedMs, cacheHit: true });
+  }
+  
+  // キャッシュミス時：DBから取得
+  const items = await fetchItemsFromDB();
+  const elapsedMs = Date.now() - start;
+  
+  // キャッシュに保存（動的フィールドを除く）
+  dbBufCache = Buffer.from(JSON.stringify({ source: "db-cache", items }));
+  dbCacheExpiresAt = now + DB_CACHE_TTL_MS;
+  
+  // レスポンスには処理時間を含める
+  res.json({ source: "db-cache", elapsedMs, cacheHit: false, items });
 });
 
-// 統計情報を取得するエンドポイント
-app.get("/stats", (req, res) => {
-  const memUsage = process.memoryUsage();
+// C) 簡易統計（確認用）
+app.get("/stats", (_req, res) => {
+  const m = process.memoryUsage();
   res.json({
-    requestCount,
-    cacheHitCount,
-    cacheHitRate: requestCount > 0 ? (cacheHitCount / requestCount * 100).toFixed(2) + "%" : "0%",
-    memory: {
-      rss: (memUsage.rss / 1024 / 1024).toFixed(2) + " MB",
-      heapTotal: (memUsage.heapTotal / 1024 / 1024).toFixed(2) + " MB",
-      heapUsed: (memUsage.heapUsed / 1024 / 1024).toFixed(2) + " MB",
-      external: (memUsage.external / 1024 / 1024).toFixed(2) + " MB",
+    cacheValidForMs: Math.max(0, dbCacheExpiresAt - Date.now()),
+    memoryMB: {
+      rss: +(m.rss / 1024 / 1024).toFixed(2),
+      heapUsed: +(m.heapUsed / 1024 / 1024).toFixed(2),
     },
   });
 });
 
-// キャッシュをリセットするエンドポイント（テスト用）
-app.post("/cache/reset", (req, res) => {
-  itemsCache = null;
-  lastFetchedAt = null;
-  requestCount = 0;
-  cacheHitCount = 0;
-  res.json({ message: "Cache reset successfully" });
-});
-
-// キャッシュをウォームアップする関数
-async function warmupCache() {
-  console.log('Warming up cache...');
-  try {
-    // 初回リクエストでキャッシュをロード
-    await generateItems().then(items => {
-      itemsCache = items;
-      lastFetchedAt = new Date().toISOString();
-    });
-    console.log('Cache warmed up successfully');
-  } catch (err) {
-    console.error('Failed to warm up cache:', err.message);
-  }
-}
-
-app.listen(port, async () => {
-  console.log(`Server running at http://localhost:${port}`);
-  console.log(`Stats endpoint: http://localhost:${port}/stats`);
-  console.log(`Cached endpoint: http://localhost:${port}/items`);
-  console.log(`No-cache endpoint (for comparison): http://localhost:${port}/items-no-cache`);
-  
-  // サーバー起動時にキャッシュをウォームアップ
-  await warmupCache();
+// =============================
+// 起動
+// =============================
+app.listen(port, () => {
+  console.log(`Server running:  http://localhost:${port}`);
+  console.log(`DB no-cache  ->  GET /items-db`);
+  console.log(`DB with TTL  ->  GET /items-db-cache`);
+  console.log(`Stats        ->  GET /stats`);
 });

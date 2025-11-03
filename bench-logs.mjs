@@ -10,7 +10,7 @@ import {
 import os from 'os';
 
 const args = process.argv.slice(2);
-const url = args[0] || 'http://localhost:3000/items';
+const url = args[0] || 'http://localhost:3000/items-db-cache';
 const cIdx = args.indexOf('-c');
 const dIdx = args.indexOf('-d');
 const connections = cIdx >= 0 ? Number(args[cIdx + 1]) : 10;
@@ -114,17 +114,20 @@ function diffStr(curr, prev) {
 const rpsDiff = prev ? diffStr(rps, prev.prevRps) : '— (baseline)';
 const latDiff = prev ? diffStr(latAvg, prev.prevLat) : '— (baseline)';
 
-// サンプルリクエストを実行してprocessingTimeMsを取得
+// サンプルリクエストを実行して処理時間を取得
 let processingTimeMs = null;
 try {
   const response = await fetch(url);
   const data = await response.json();
-  if (data && typeof data.processingTimeMs === 'number') {
+  // elapsedMs または processingTimeMs の両方に対応
+  if (data && typeof data.elapsedMs === 'number') {
+    processingTimeMs = data.elapsedMs;
+  } else if (data && typeof data.processingTimeMs === 'number') {
     processingTimeMs = data.processingTimeMs;
   }
 } catch (err) {
   // エラーが発生しても続行
-  console.warn(`Warning: Could not fetch processingTimeMs: ${err.message}`);
+  console.warn(`Warning: Could not fetch processing time: ${err.message}`);
 }
 
 // 追記するMarkdown

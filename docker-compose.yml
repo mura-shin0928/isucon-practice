@@ -1,0 +1,21 @@
+# Docker Compose Specification (v2互換)
+# 動作確認環境: Docker Compose v2.40.0
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: isucon-practice-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: isucon_practice
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: --default-authentication-plugin=mysql_native_password
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
