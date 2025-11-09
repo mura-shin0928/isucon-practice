@@ -28,10 +28,10 @@ const DB_CACHE_TTL_MS = 60_000; // 60s: 計測10s+ウォームアップを覆う
 // =============================
 // 共通: DBからitems取得
 // =============================
-async function fetchItemsFromDB() {
-  const [rows] = await pool.query(
-    "SELECT id, name, description, price, category FROM items"
-  );
+async function fetchItemsFromDB(query = "") {
+  const [rows] = query ? 
+    await pool.query(`SELECT id, name, description, price, category FROM items WHERE category = ?`, [query]) :
+    await pool.query("SELECT id, name, description, price, category FROM items");
   return rows;
 }
 
@@ -40,9 +40,10 @@ async function fetchItemsFromDB() {
 // =============================
 
 // A) 毎回DBアクセス（キャッシュなし）
-app.get("/items-db", async (_req, res) => {
+app.get("/items-db", async (req, res) => {
   const start = Date.now();
-  const items = await fetchItemsFromDB();
+  const category = req.query?.category;
+  const items = await fetchItemsFromDB(category);
   res.json({ source: "db", elapsedMs: Date.now() - start, items });
 });
 
