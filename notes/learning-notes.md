@@ -13,7 +13,7 @@ ISUCON出場・完走・スコアアップ
 | **OS / Linux** | ⚪ 未着手 | CPU・メモリ・I/O、プロセス・スレッド監視（top, dstat） | |
 | **Webサーバ** | ⚪ 未着手 | Nginx設定、Keep-Alive、リバースプロキシ、静的キャッシュ | |
 | **アプリケーション** | 🔵 習得中 | Express/Rust最適化、非同期処理、キャッシュ戦略 | キャッシュは重い処理（10ms以上）で効果発揮、アムダールの法則で効果判定 |
-| **データベース** | 🔵 習得中 | MySQL INDEX、N+1対策、EXPLAINによる分析 | MySQL接続・クエリ実行、EXPLAINで実行計画確認、type=ALL（フルスキャン）とtype=ref（インデックス使用）の理解、インデックス作成と効果測定、複合インデックス・カバリングインデックスの比較、Using index/Using index condition/Using whereの違い、MySQLオプティマイザの意思決定構造（左端一致、統計情報、選択性、コストベース最適化）の理解 |
+| **データベース** | 🔵 習得中 | MySQL INDEX、N+1対策、EXPLAINによる分析 | MySQL接続・クエリ実行、EXPLAINで実行計画確認、type=ALL（フルスキャン）とtype=ref（インデックス使用）の理解、インデックス作成と効果測定、複合インデックス・カバリングインデックスの比較、Using index/Using index condition/Using whereの違い、MySQLオプティマイザの意思決定構造（左端一致、統計情報、選択性、コストベース最適化）の理解、ORDER BY/LIMITのインデックス最適化、type=index（インデックスフルスキャン）とfilesortの関係、FORCE INDEXの活用 |
 | **ベンチ / 計測** | 🔵 習得中 | autocannon・wrkなどでの負荷試験・再測定 | processingTimeMs追加、キャッシュあり/なし比較で効果可視化、インデックス効果測定の実践 |
 | **観測 / 可視化** | 🔵 習得中 | p95/p99レイテンシ、slow query log、メトリクス分析 | 処理時間をレスポンスに含めて可視化、統計エンドポイント実装、EXPLAINで実行計画を可視化 |
 | **環境構築** | 🟢 開始 | Docker/Composeで再現環境を作る | Docker ComposeでMySQL環境構築 |
@@ -88,6 +88,23 @@ ISUCON出場・完走・スコアアップ
 - **アクション:** MySQLの実行計画（EXPLAIN）の詳細分析を進め、複合インデックスとカバリングインデックスの挙動を比較した。Using where / Using index condition / Using index の違いを実例で観測し、インデックス利用の判断基準を理解した。
 - **結果:** 
 - **気づき:** Using index が出る＝テーブルアクセスなし（完全なカバリングINDEX）。Using index condition はテーブルアクセスを減らす中間状態（Index Condition Pushdown）。Using where はWHERE句評価をテーブル上で行う状態で、全件走査か部分最適化。選択性の低いインデックスでは逆に遅くなる場合もあり、オプティマイザがコストベースで最適化を選択する。MySQLオプティマイザの意思決定構造（左端一致、統計情報、選択性、ソート最適化など）を体系的に理解した。
+
+### Day 6（2025-11-17）
+- **テーマ:** ORDER BY / LIMIT のインデックス最適化
+- **アクション:** 
+  - `EXPLAIN SELECT * FROM items ORDER BY price DESC LIMIT 10` でベースライン取得
+  - `idx_items_price`（price用インデックス）を作成
+  - `FORCE INDEX` を使って、ORDER BY / LIMIT がインデックスだけで処理される挙動を確認
+  - category 条件を加えた場合の Using where の意味を分析
+- **結果:** 
+  - price インデックスを貼ってもテーブルが小さすぎるため、MySQL はフルスキャン＋filesort を選択
+  - `FORCE INDEX` を使うと、`type=index` でソートなしに LIMIT が効くことを確認
+  - WHERE 条件（category）は price インデックスでは絞れないため Using where が出ることを確認
+- **気づき:** 
+  - インデックスは「ORDER BY / LIMIT」には効くが、WHERE 条件に使えないと結局 Using where が発生する
+  - 小さなテーブルでは、MySQL が「インデックスよりフルスキャンの方が安い」と判断するケースがある
+  - `type=index` は「インデックスフルスキャン」であり、LIMIT が効く場合は実質かなり高速に動く
+  - 複合インデックス `(category, price)` を作れば WHERE も ORDER BY も LIMIT も "索引だけで完結" する可能性が高い
 
 ---
 
@@ -430,3 +447,99 @@ MySQLはクエリ実行前にコストを見積もり、最安ルートを選択
 - index利用による「ランダムI/O」が、フルスキャンの「連続I/O」を上回る場合もある
 - オプティマイザの判断を鵜呑みにせず、EXPLAIN で根拠を観測する
 - **絶対指標は「I/Oをどれだけ減らせたか」**
+
+### ORDER BY / LIMIT のインデックス最適化
+
+#### なぜORDER BY / LIMITにインデックスが効くのか？
+
+**ORDER BY / LIMIT の高速化には「インデックス順のまま範囲を読む」ことが重要。**
+
+- インデックスは既にソート済みの状態で保持されている
+- `ORDER BY price DESC LIMIT 10` の場合、priceインデックスを逆順に読んで最初の10件だけ取得すればよい
+- テーブル全体をソートする必要がない（`filesort`が不要）
+
+#### 実践例：priceインデックスの効果
+
+**ベースライン（インデックスなし）**
+```sql
+EXPLAIN SELECT * FROM items ORDER BY price DESC LIMIT 10;
+```
+- `type=ALL`（フルスキャン）
+- `Extra=Using filesort`（ソート処理が必要）
+
+**priceインデックス作成後**
+```sql
+CREATE INDEX idx_items_price ON items(price);
+EXPLAIN SELECT * FROM items ORDER BY price DESC LIMIT 10;
+```
+- テーブルが小さい場合、MySQLは「フルスキャン＋filesort」の方が安いと判断
+- `type=ALL`、`Extra=Using filesort` のまま（インデックスを使わない）
+
+**FORCE INDEXで強制使用**
+```sql
+EXPLAIN SELECT * FROM items FORCE INDEX(idx_items_price) ORDER BY price DESC LIMIT 10;
+```
+- `type=index`（インデックスフルスキャン）
+- `Extra=`（filesortなし）
+- LIMITが効くため、実質的に高速
+
+#### type=index の意味
+
+- **インデックスフルスキャン**：インデックス全体を読む
+- 一見すると遅そうだが、LIMITが効く場合は実質かなり高速
+- インデックスはソート済みなので、先頭から必要な分だけ読めばよい
+
+#### WHERE条件との組み合わせ
+
+**問題：WHERE条件がインデックスに含まれていない場合**
+
+```sql
+SELECT * FROM items WHERE category='Books' ORDER BY price DESC LIMIT 10;
+```
+
+- priceインデックスだけではcategoryで絞れない
+- `Using where`が発生：行ごとにcategory条件を評価する必要がある
+- テーブルアクセスが必要になり、I/Oが増える
+
+**解決策：複合インデックス**
+
+```sql
+CREATE INDEX idx_items_category_price ON items(category, price);
+```
+
+- WHERE条件（category）もORDER BY（price）も同じインデックスで処理可能
+- `Using where`が消え、インデックスだけで完結する可能性が高い
+- LIMITも効くため、非常に高速
+
+#### オプティマイザの判断：なぜインデックスを使わないことがあるのか？
+
+**小さなテーブルでの判断**
+
+- テーブルが小さい（100行程度）場合、フルスキャン＋filesortの方が速いと判断される
+- インデックスを読むコスト（ランダムI/O）が、フルスキャン（連続I/O）より高いと見積もられる
+- オプティマイザはコストベースで最適化を選択する
+
+**FORCE INDEXの活用**
+
+- オプティマイザの判断が間違っている可能性がある場合に使用
+- ただし、データ量が増えるとオプティマイザの判断が変わる可能性がある
+- 本番環境では慎重に使用する
+
+#### ISUCONでの実践ポイント
+
+1. **ORDER BY / LIMIT クエリの最適化**
+   - ソート対象のカラムにインデックスを作成
+   - `type=index` で `filesort` が消えることを確認
+
+2. **WHERE条件との組み合わせ**
+   - WHERE条件とORDER BYの両方に対応する複合インデックスを検討
+   - 左端一致を意識：`(category, price)` なら `WHERE category=? ORDER BY price` に有効
+
+3. **LIMITの効果**
+   - LIMITがある場合、インデックスフルスキャンでも実質高速
+   - 必要な行数だけ読めばよいため
+
+4. **オプティマイザとの付き合い方**
+   - 小さなテーブルではインデックスを使わない判断も正しい場合がある
+   - データ量が増えると判断が変わる可能性を理解する
+   - EXPLAINで実行計画を常に確認する
